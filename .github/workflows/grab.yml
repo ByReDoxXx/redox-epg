@@ -1,0 +1,80 @@
+# RedoX TV yayın akışı: iptv-org/epg aracıyla TV+'tan (bir kanal Digiturk), yalnız
+# redox.channels.xml'deki kanallar için 3 günlük XMLTV üretir; epgshare01'in
+# Türkiye dosyasıyla birlikte şifreli ve imzalı epg.bin paketine koyar
+# (tools/pack.mjs). Uygulama dosyayı raw.githubusercontent.com adresinden indirir.
+name: Yayın akışı
+
+on:
+  schedule:
+    # Günde iki kez (UTC 02:15 ve 14:15 = TSİ 05:15 ve 17:15).
+    - cron: '15 2,14 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: grab
+  cancel-in-progress: false
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: iptv-org/epg aracını indir
+        run: |
+          git clone --depth 1 -b master https://github.com/iptv-org/epg.git ../iptv-epg
+          cd ../iptv-epg
+          git log --oneline -1
+          npm ci --no-audit --no-fund
+
+      # TV+ her istekte oturum açıyor; istekler sıklaşınca oturum açma
+      # başarısız oluyor. 1,5 sn bekleme ile hata kalmadı (yerelde denendi).
+      - name: Akışı indir
+        working-directory: ../iptv-epg
+        run: >
+          npm run grab ---
+          --channels="$GITHUB_WORKSPACE/redox.channels.xml"
+          --output="$RUNNER_TEMP/guide.xml"
+          --gzip
+          --days=3
+          --delay=1500
+
+      - name: epgshare01 dosyasını indir
+        run: curl -fsS --retry 3 -m 120 -o "$RUNNER_TEMP/epgshare01.xml.gz" https://epgshare01.online/epgshare01/epg_ripper_TR1.xml.gz
+
+      # Boş ya da çok az programlı çıktı eldeki dosyanın yerine yazılmaz.
+      # epgshare01 inmezse yalnız iptv-org çıktısıyla devam edilir.
+      - name: Denetle ve paketle
+        env:
+          REDOX_DATA_KEY: ${{ secrets.REDOX_DATA_KEY }}
+          REDOX_SIGN_KEY: ${{ secrets.REDOX_SIGN_KEY }}
+        run: |
+          count=$(grep -c '<programme' "$RUNNER_TEMP/guide.xml" || true)
+          echo "program: $count"
+          if [ "$count" -lt 500 ]; then
+            echo "::error::Çok az program ($count); dosya güncellenmedi."
+            exit 1
+          fi
+          sources=()
+          if gzip -t "$RUNNER_TEMP/epgshare01.xml.gz" 2>/dev/null; then sources+=("$RUNNER_TEMP/epgshare01.xml.gz"); fi
+          sources+=("$RUNNER_TEMP/guide.xml.gz")
+          node tools/pack.mjs epg "${sources[@]}" epg.bin
+
+      # epg.bin her çalışmada değişir (rastgele nonce). Depo şişmesin diye
+      # önceki çalışmanın işlemesinin üzerine yazılır.
+      - name: Depoya yaz
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add epg.bin
+          if git log -1 --format=%an | grep -q 'github-actions\[bot\]'; then
+            git commit --amend -m "Yayın akışı $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push --force-with-lease
+          else
+            git commit -m "Yayın akışı $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
